@@ -1,0 +1,6 @@
+ : cannot connect to X server localhost:10.0
+Avg symbol energy before AWGN: chEs: 3.820 dBm
+Avg. received symbol energy: rxEs: 4.317 dBm
+One-sided noise PSD (N0): 0.121
+SNR: 10dB - MMSE Bit Error Rate (BER) = 3/2000.0 = 0.15%
+SNR: 10dB - ZF Bit Error Rate (BER): 5/2000.0 = 0.25%
