@@ -14,6 +14,7 @@ import os
 import time
 import pyopencl as cl
 import pyopencl.array
+#from pyfft.cl import Plan
 import numpy as np
 from scipy import signal
 # To avoid "backend has already been chosen error," set GPU platform before
@@ -29,7 +30,7 @@ import matplotlib.pyplot as plt
 # Local defs and imports
 PLOT_MAGNITUDE_SPECTRA = True
 PLOT_POWER_SPECTRA = True
-SHOW_PLOTS = True
+SHOW_PLOTS = False
 PRINT_KERNELS = False
 
 def _main():
@@ -99,7 +100,22 @@ def _main():
     ZFoutfft = rxfrmfft * ZFfft
     MMSEout = np.fft.ifft(MMSEoutfft)
     ZFout = np.fft.ifft(ZFoutfft)
-
+    '''
+    print 'rxfrm ', rxfrm.shape
+    print 'rxfrmfft ', rxfrmfft
+    print 'fftlen ', fftlen
+    print 'MMSEfft ' , MMSEfft.shape
+    print 'MMSEoutfft ', MMSEoutfft.shape
+    '''
+    ocl_result = opencl_compute(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfrmfft)
+    print 'ocl_result = ', ocl_result
+    '''
+    #print 'rxfrmfft = ', rxfrmfft
+    #print 'MMSEfft = ', MMSEfft
+    print 'MMSEoutfft = ', MMSEoutfft
+    print 'mul_result' , mul_result
+    print mul_result.shape
+    '''
     # Demodulate received symbols to recover user data
     MMSEdata, MMSEdatabinary = QAMdemodulate(MMSEout[:frmlen], constell)
     ZFdata, ZFdatabinary = QAMdemodulate(ZFout[:frmlen], constell)
@@ -197,7 +213,7 @@ def _main():
 #    Tuple: (context, queue)
 #------------------------------------------------------------------------------
 
-def opencl_compute(rxframe, fftlen, mmsefft, zffft, rxfft):
+def opencl_compute(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfft):
 
     #Selecting OpenCL platform;
     NAME = 'NVIDIA CUDA'
@@ -213,37 +229,121 @@ def opencl_compute(rxframe, fftlen, mmsefft, zffft, rxfft):
         properties = cl.command_queue_properties.PROFILING_ENABLE)
 
     #Setup memory flags
+    #Input Buffers
     mf=cl.mem_flags
     rxfft_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rxfft)
-    rxframe_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rxframe)
-    mmsefft_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=mmsefft)
-    zffft_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=zffft)
-    mmseout_buf = cl.Buffer(ctx, mf.WRITE_ONLY, mmsefft.nbytes)
-    zfout_buf = cl.Buffer(ctx, mf.WRITE_ONLY, zffft.nbytes)
+    rxfrm_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rxfrm)
+    MMSEfft_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=MMSEfft)
+    ZFfft_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=ZFfft)
+    
+    #Output Buffers. 
+    MMSEoutfft_buf = cl.Buffer(ctx, mf.WRITE_ONLY, MMSEoutfft.nbytes)
+    ZFoutfft_buf = cl.Buffer(ctx, mf.WRITE_ONLY, ZFoutfft.nbytes)
+    MMSEout_buf = cl.Buffer(ctx, mf.WRITE_ONLY, MMSEfft.nbytes)
+    ZFout_buf = cl.Buffer(ctx, mf.WRITE_ONLY, ZFfft.nbytes)
 
+    
     #rxfft = np.fft.fft(rxframe, fftlen)
 
     prg = cl.Program(ctx, """
+//Declarations
+#define USE_MAD 1
 
-   #include <pyopencl-complex.h>
+#if CONFIG_USE_DOUBLE
 
-   __kernel void multiply(__global const cfloat_t *rxfft, __global const cfloat_t *in2, __global cfloat_t *out){
-int i = get_global_id(0);
-out[i] = cfloat_mul(rxfft[i],in2[i]);
+#if defined(cl_khr_fp64)  // Khronos extension available?
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)  // AMD extension available?
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+// double
+typedef double real_t;
+typedef double2 real2_t;
+#define FFT_PI 3.14159265358979323846
+#define FFT_SQRT_1_2 0.70710678118654752440
+
+#else
+
+// float
+typedef float real_t;
+typedef float2 real2_t;
+#define FFT_PI       3.14159265359f
+#define FFT_SQRT_1_2 0.707106781187f
+#endif
+
+#include <pyopencl-complex.h>
+
+// Return A*B
+real2_t mul(real2_t a, real2_t b)
+{
+#if USE_MAD
+  return (real2_t)(mad(a.x, b.x, -a.y * b.y), mad(a.x, b.y, a.y * b.x)); // mad
+#else
+  return (real2_t)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); // no mad
+#endif
+}
+
+// Return A * exp(K*ALPHA*i)
+real2_t twiddle(real2_t a, int k, real_t alpha)
+{
+  real_t cs,sn;
+  sn = sincos((real_t)k * alpha, &cs);
+  return mul(a, (real2_t)(cs, sn));
+}
+
+// In-place DFT-2, output is (a,b). Arguments must be variables.
+#define DFT2(a,b) { real2_t tmp = a - b; a += b; b = tmp; }
+
+__kernel void fftRadix2Kernel(__global const real2_t * x,__global real2_t * y,int p)
+{
+  int t = get_global_size(0); // thread count
+  int i = get_global_id(0);   // thread index
+  int k = i & (p - 1);            // index in input sequence, in 0..P-1
+  int j = ((i - k) << 1) + k;     // output index
+  real_t alpha = -FFT_PI * (real_t)k / (real_t)p;
+  
+  // Read and twiddle input
+  x += i;
+  real2_t u0 = x[0];
+  real2_t u1 = twiddle(x[t], 1, alpha);
+
+  // In-place DFT-2
+  DFT2(u0, u1);
+
+  // Write output
+  y += j;
+  y[0] = u0;
+  y[p] = u1;
+}
+
+__kernel void multiply(__global const cfloat_t *rxfft, __global const cfloat_t *in2, __global cfloat_t *out){
+int gid = get_global_id(0);
+out[gid] = cfloat_mul(rxfft[gid], in2[gid]);
+
 }
 
 """).build()
 
-    mul_result = np.empty((fftlen, ), dtype= rxframe.dtype)
-    prg.multiply(queue, (fftlen, ), None, rxfft_buf, mmsefft_buf, mmseout_buf)
-    cl.enqueue_copy(queue, mul_result, mmseout_buf)
+    fft_result = np.empty((fftlen,), dtype= rxfrm.dtype)
+    prg.fftRadix2Kernel(queue, (fftlen, ), None, rxfrm_buf, rxfft_buf, np.uint32(fftlen))
+    cl.enqueue_copy(queue, fft_result, rxfft_buf)
 
-    fft_result = np.empty((fftlen,), dtype= rxframe.dtype)
-    prg.fftRadix2Kernel(queue, (fftlen, ), None, rxframe_buf, mmseout_buf, np.uint32(fftlen))
-    cl.enqueue_copy(queue, fft_result, mmseout_buf)
-    print 'fftlen: ', fftlen
+    MMSEmul_result = np.empty((fftlen, ), dtype= rxfrm.dtype)
+    prg.multiply(queue, (fftlen,), None, rxfft_buf, MMSEfft_buf, MMSEoutfft_buf)
+    cl.enqueue_copy(queue, MMSEmul_result, MMSEoutfft_buf)
 
-    return mul_result
+    ZFmul_result = np.empty((fftlen, ), dtype= rxfrm.dtype)
+    prg.multiply(queue, (fftlen,), None, rxfft_buf, ZFfft_buf, ZFoutfft_buf)
+    cl.enqueue_copy(queue, ZFmul_result, ZFoutfft_buf)
+
+    #MMSEout_ocl = np.fft.ifft(MMSEmul_result)
+    #ZFout_ocl = np.fft.ifft(ZFmul_result)   
+   # print 'fftlen: ', fftlen       
+    #print np.allclose(mul_result, MMSEoutfft)
+    print 'fft =', fft_result
+   # print 'MMSEmul_result ', MMSEmul_result
+   # print 'MMSEout_ocl' , MMSEout_ocl
+    return (MMSEmul_result, ZFmul_result)
 
 def init_ocl_runtime(pltname='NVIDIA CUDA'):
 
