@@ -100,22 +100,15 @@ def _main():
     ZFoutfft = rxfrmfft * ZFfft
     MMSEout = np.fft.ifft(MMSEoutfft)
     ZFout = np.fft.ifft(ZFoutfft)
-    '''
-    print 'rxfrm ', rxfrm.shape
-    print 'rxfrmfft ', rxfrmfft
-    print 'fftlen ', fftlen
-    print 'MMSEfft ' , MMSEfft.shape
-    print 'MMSEoutfft ', MMSEoutfft.shape
-    '''
+
+   
     ocl_result = opencl_compute(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfrmfft)
-    print 'ocl_result = ', ocl_result
-    '''
-    #print 'rxfrmfft = ', rxfrmfft
-    #print 'MMSEfft = ', MMSEfft
-    print 'MMSEoutfft = ', MMSEoutfft
-    print 'mul_result' , mul_result
-    print mul_result.shape
-    '''
+    #print 'ocl_result = ', ocl_result
+    np_rec_time = numpy_time(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfrmfft)
+    print 'numpy time = ', np_rec_time
+    print 'ocl time   = ', ocl_result[2]
+    #ocl_rec_time = ocl_time(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfrmfft)    
+    #print 'times ', ocl_rec_time
     # Demodulate received symbols to recover user data
     MMSEdata, MMSEdatabinary = QAMdemodulate(MMSEout[:frmlen], constell)
     ZFdata, ZFdatabinary = QAMdemodulate(ZFout[:frmlen], constell)
@@ -336,14 +329,27 @@ out[gid] = cfloat_mul(rxfft[gid], in2[gid]);
     prg.multiply(queue, (fftlen,), None, rxfft_buf, ZFfft_buf, ZFoutfft_buf)
     cl.enqueue_copy(queue, ZFmul_result, ZFoutfft_buf)
 
+    M =3
+    times = []
+    for i in xrange(M):
+            start = time.time()
+            evt1 = prg.fftRadix2Kernel(queue, (fftlen, ), None, rxfrm_buf, rxfft_buf, np.uint32(fftlen))
+            evt1.wait()
+            evt2 = prg.multiply(queue, (fftlen,), None, rxfft_buf, MMSEfft_buf, MMSEoutfft_buf)
+            evt2.wait()
+            evt3 = prg.multiply(queue, (fftlen,), None, rxfft_buf, ZFfft_buf, ZFoutfft_buf)
+            evt3.wait()
+            times.append(time.time()-start)
+    times = np.average(times)
+
     #MMSEout_ocl = np.fft.ifft(MMSEmul_result)
     #ZFout_ocl = np.fft.ifft(ZFmul_result)   
    # print 'fftlen: ', fftlen       
     #print np.allclose(mul_result, MMSEoutfft)
-    print 'fft =', fft_result
+    #print 'fft =', fft_result
    # print 'MMSEmul_result ', MMSEmul_result
    # print 'MMSEout_ocl' , MMSEout_ocl
-    return (MMSEmul_result, ZFmul_result)
+    return (MMSEmul_result, ZFmul_result, times)
 
 def init_ocl_runtime(pltname='NVIDIA CUDA'):
 
@@ -360,6 +366,31 @@ def init_ocl_runtime(pltname='NVIDIA CUDA'):
 
     return (context, queue)
 
+def numpy_time(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfft):
+    
+    M =3 
+    times = []
+    for i in xrange(M):
+            start = time.time()
+            rxfrmfft = np.fft.fft(rxfrm, fftlen)
+            MMSEoutfft = rxfrmfft * MMSEfft
+            ZFoutfft = rxfrmfft * ZFfft
+            MMSEout = np.fft.ifft(MMSEoutfft)
+            ZFout = np.fft.ifft(ZFoutfft)       
+            times.append(time.time()-start)
+    
+    return np.average(times)
+
+def ocl_time(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfft):
+
+    M =3
+    times = []
+    for i in xrange(M):
+            start = time.time()
+            evt = opencl_compute(rxfrm, fftlen, MMSEfft, ZFfft, MMSEoutfft, ZFoutfft, rxfft)
+            times.append(time.time()-start)
+
+    return np.average(times)
 #------------------------------------------------------------------------------
 # QAMmodulate(frmlen, constell)
 #   This function performs QAM modulation by generating random user data and
